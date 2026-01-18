@@ -1,0 +1,18 @@
+name: ElijahsWhirlwind
+version: 1.0.0
+main: ElijahsWhirlwind
+api-version: 1.19
+author: Elijah
+description: Elijah's Whirlwind - Chaos theory-based whirlwind generation plugin for Minecraft
+
+commands:
+  whirlwind:
+    description: Manage Elijah's whirlwinds
+    usage: /whirlwind [spawn|list|stop] [world] [radius] [intensity]
+    permission: whirlwind.admin
+    permission-message: You don't have permission to use this command.
+
+permissions:
+  whirlwind.admin:
+    description: Allows managing Elijah's whirlwinds
+    default: op
