@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elijah's Whirlwind — 3D Placer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { overflow: hidden; font-family: 'Segoe UI', system-ui, sans-serif; background: #0a0a0f; }
+    #canvas { display: block; }
+    #ui {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      width: 280px;
+      background: rgba(12, 12, 18, 0.92);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 10px;
+      padding: 14px;
+      color: #e0e0e8;
+      font-size: 13px;
+      pointer-events: auto;
+    }
+    #ui h1 { font-size: 14px; font-weight: 600; margin-bottom: 10px; color: #b8c4e0; }
+    #ui label { display: block; margin-top: 8px; margin-bottom: 2px; color: #9098b0; }
+    #ui input[type="range"] { width: 100%; margin: 4px 0; accent-color: #5a8fd4; }
+    #ui .row { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
+    #ui button {
+      flex: 1;
+      padding: 8px 12px;
+      border: none;
+      border-radius: 6px;
+      background: #2a3548;
+      color: #c8d0e0;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    #ui button:hover { background: #3a4558; }
+    #ui button.primary { background: #3d6ab8; color: #fff; }
+    #ui button.primary:hover { background: #4a7ac8; }
+    #ui button.danger { background: #8b3a3a; color: #fff; }
+    #ui button.danger:hover { background: #a04848; }
+    #whirlwind-list { max-height: 140px; overflow-y: auto; margin-top: 10px; }
+    #whirlwind-list .item {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 6px 8px; margin-bottom: 4px; background: rgba(255,255,255,0.04);
+      border-radius: 6px; font-size: 12px;
+    }
+    #whirlwind-list .item { flex-wrap: wrap; gap: 4px; }
+    #whirlwind-list .item .label { flex: 1 1 100%; }
+    #whirlwind-list .item button { flex: 0 0 auto; padding: 4px 8px; }
+    #whirlwind-list .item input[type="file"] { display: none; }
+    #whirlwind-list .item .usda-name { font-size: 10px; color: #606880; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #hint {
+      position: fixed;
+      bottom: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      padding: 6px 12px;
+      background: rgba(0,0,0,0.6);
+      border-radius: 6px;
+      font-size: 12px;
+      color: #a0a8c0;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="ui">
+    <h1>Elijah's Whirlwind</h1>
+    <p style="margin-bottom:8px;color:#8088a0;">Click on the ground to place a whirlwind.</p>
+    <label>Radius</label>
+    <input type="range" id="radius" min="1" max="80" value="20" step="1">
+    <span id="radiusVal">20</span>
+    <label>Intensity (0–1)</label>
+    <input type="range" id="intensity" min="0.2" max="1" value="0.7" step="0.05">
+    <span id="intensityVal">0.70</span>
+    <label>Pitch (degrees, -90 to 90)</label>
+    <input type="range" id="pitch" min="-90" max="90" value="0" step="5">
+    <span id="pitchVal">0</span>
+    <label>Model size (% of whirlwind radius)</label>
+    <input type="range" id="modelScale" min="5" max="150" value="90" step="5">
+    <span id="modelScaleVal">90</span>
+    <div class="row" style="margin-top:10px;">
+      <button type="button" id="btn-clear" class="danger">Clear all</button>
+    </div>
+    <div id="whirlwind-list"></div>
+  </div>
+  <div id="hint">Click ground to place · Per whirlwind: Model = .usda / .stl / .3mf · Drag to rotate</div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+    import { ThreeMFLoader } from 'three/addons/loaders/3MFLoader.js';
+
+    // —— Minimal USDA (Pixar USD ASCII) parser ——
+    // Extracts Xforms (translate) and Meshes (points); returns flattened points with accumulated transform
+    function parseUSDA(text) {
+      const points = [];
+      const rePoint = /\(([^,]+),([^,]+),([^)]+)\)/g;
+
+      function extractPoints(str) {
+        const out = [];
+        let m;
+        rePoint.lastIndex = 0;
+        while ((m = rePoint.exec(str)) !== null) {
+          out.push([
+            parseFloat(m[1].trim()),
+            parseFloat(m[2].trim()),
+            parseFloat(m[3].trim())
+          ]);
+        }
+        return out;
+      }
+
+      const lines = text.split(/\r?\n/);
+      const stack = []; // [{ tx, ty, tz }]
+      let inMesh = false;
+      let meshBuffer = '';
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const t = line.trim();
+
+        if (t.startsWith('def ') && t.includes('Xform')) {
+          let tx = 0, ty = 0, tz = 0;
+          for (let j = i + 1; j < lines.length; j++) {
+            const l = lines[j].trim();
+            if (l === '}') break;
+            const tr = l.match(/(?:double3|float3)\s+xformOp:translate\s*=\s*\(([^)]+)\)/);
+            if (tr) {
+              const parts = tr[1].split(',').map((s) => parseFloat(s.trim()));
+              tx = parts[0]; ty = parts[1]; tz = parts[2];
+              break;
+            }
+          }
+          stack.push({ tx, ty, tz });
+          continue;
+        }
+
+        if (t.startsWith('def ') && t.includes('Mesh')) {
+          inMesh = true;
+          meshBuffer = '';
+          continue;
+        }
+
+        if (inMesh) {
+          meshBuffer += ' ' + line;
+          if (t === '}') {
+            const arr = meshBuffer.match(/point3f\s+points\s*=\s*\[([\s\S]*?)\]/);
+            if (arr) {
+              const meshPoints = extractPoints(arr[1]);
+              let tx = 0, ty = 0, tz = 0;
+              for (const s of stack) {
+                tx += s.tx; ty += s.ty; tz += s.tz;
+              }
+              for (const p of meshPoints) {
+                points.push([p[0] + tx, p[1] + ty, p[2] + tz]);
+              }
+            }
+            inMesh = false;
+            if (stack.length) stack.pop();
+          }
+          continue;
+        }
+
+        if (t === '}') {
+          if (stack.length) stack.pop();
+        }
+      }
+
+      // Fallback: any point3f points = [...] in the file
+      if (points.length === 0) {
+        const blob = text.replace(/\s+/g, ' ');
+        const arr = blob.match(/point3f\s+points\s*=\s*\[([^\]]+)\]/);
+        if (arr) {
+          const meshPoints = extractPoints(arr[1]);
+          for (const p of meshPoints) points.push([p[0], p[1], p[2]]);
+        }
+      }
+
+      return points;
+    }
+
+    // —— Config (from plugin) ——
+    const CONFIG = {
+      BASE_WIND_SPEED: 10.0,
+      MAX_WIND_RADIUS_RATIO: 0.3,
+      WIND_DECAY_EXPONENT: 0.65,
+      ASYMMETRY_FACTOR: 0.25,
+      MIN_WIND_RADIUS_RATIO: 0.05,
+      HOLLAND_B_PARAMETER: 1.5,
+      MOVE_SPEED: 0.08,
+    };
+
+    // —— Whirlwind class (browser port, no Bukkit) ——
+    class Whirlwind {
+      constructor(centerX, centerY, centerZ, radius, intensity, orientationYaw = 0, orientationPitch = 0) {
+        this.centerX = centerX;
+        this.centerY = centerY;
+        this.centerZ = centerZ;
+        this.radius = radius;
+        this.intensity = intensity;
+        this.orientationYaw = orientationYaw;
+        this.orientationPitch = orientationPitch * (Math.PI / 180);
+
+        const yaw = this.orientationYaw;
+        const pitch = this.orientationPitch;
+        this.forwardX = Math.cos(yaw) * Math.cos(pitch);
+        this.forwardY = Math.sin(pitch);
+        this.forwardZ = Math.sin(yaw) * Math.cos(pitch);
+        const fl = Math.hypot(this.forwardX, this.forwardY, this.forwardZ);
+        if (fl > 1e-6) {
+          this.forwardX /= fl; this.forwardY /= fl; this.forwardZ /= fl;
+        }
+
+        const worldUpY = 1;
+        this.rightX = this.forwardZ * worldUpY - this.forwardY * 0;
+        this.rightY = this.forwardX * 0 - this.forwardZ * 0;
+        this.rightZ = this.forwardY * 0 - this.forwardX * worldUpY;
+        const rl = Math.hypot(this.rightX, this.rightY, this.rightZ);
+        if (rl > 1e-6) {
+          this.rightX /= rl; this.rightY /= rl; this.rightZ /= rl;
+        } else {
+          this.rightX = 1; this.rightY = 0; this.rightZ = 0;
+        }
+
+        this.upX = this.rightY * this.forwardZ - this.rightZ * this.forwardY;
+        this.upY = this.rightZ * this.forwardX - this.rightX * this.forwardZ;
+        this.upZ = this.rightX * this.forwardY - this.rightY * this.forwardX;
+        const ul = Math.hypot(this.upX, this.upY, this.upZ);
+        if (ul > 1e-6) {
+          this.upX /= ul; this.upY /= ul; this.upZ /= ul;
+        }
+
+        const baseWind = CONFIG.BASE_WIND_SPEED * (5 + intensity * 20);
+        this.maxWindSpeed = baseWind * Math.pow(radius / 100, 0.3);
+        this.radiusMaxWind = radius * CONFIG.MAX_WIND_RADIUS_RATIO;
+        this.radiusMinWind = Math.max(radius * CONFIG.MIN_WIND_RADIUS_RATIO, 0.5);
+        this.speed = CONFIG.MOVE_SPEED * (0.5 + intensity);
+        this.forwardMotionX = this.forwardX * this.speed;
+        this.forwardMotionY = this.forwardY * this.speed;
+        this.forwardMotionZ = this.forwardZ * this.speed;
+      }
+
+      calculateWindSpeed(distance) {
+        if (distance < this.radiusMinWind)
+          return (distance / this.radiusMinWind) * this.maxWindSpeed * 0.1;
+        if (distance < this.radiusMaxWind)
+          return this.maxWindSpeed * (distance / this.radiusMaxWind);
+        const rMax = this.radiusMaxWind;
+        return Math.max(this.maxWindSpeed * Math.pow(rMax / distance, CONFIG.WIND_DECAY_EXPONENT), 0.5);
+      }
+
+      calculateWindVector3D(x, y, z) {
+        const dotRelF = x * this.forwardX + y * this.forwardY + z * this.forwardZ;
+        const distSq = x * x + y * y + z * z;
+        const distance = Math.sqrt(Math.max(0, distSq - dotRelF * dotRelF));
+        if (distance < 0.1 || distance > this.radius)
+          return { x: 0, y: 0, z: 0, speed: 0 };
+
+        let windSpeed = this.calculateWindSpeed(distance);
+        const rightC = x * this.rightX + y * this.rightY + z * this.rightZ;
+        const upC = x * this.upX + y * this.upY + z * this.upZ;
+        const positionAngle = Math.atan2(upC, rightC);
+        const windAngle = positionAngle + Math.PI / 2;
+        const localWindRight = -Math.sin(windAngle);
+        const localWindUp = Math.cos(windAngle);
+
+        let windX = localWindRight * this.rightX + localWindUp * this.upX;
+        let windY = localWindRight * this.rightY + localWindUp * this.upY;
+        let windZ = localWindRight * this.rightZ + localWindUp * this.upZ;
+
+        const fRight = this.forwardMotionX * this.rightX + this.forwardMotionY * this.rightY + this.forwardMotionZ * this.rightZ;
+        const fUp = this.forwardMotionX * this.upX + this.forwardMotionY * this.upY + this.forwardMotionZ * this.upZ;
+        const forwardAngle = Math.atan2(fUp, fRight);
+        const asym = Math.cos(positionAngle - forwardAngle);
+        windSpeed *= 1 + CONFIG.ASYMMETRY_FACTOR * Math.max(0, asym);
+
+        return { x: windX * windSpeed, y: windY * windSpeed, z: windZ * windSpeed, speed: windSpeed };
+      }
+
+      getCenter() {
+        return new THREE.Vector3(this.centerX, this.centerY, this.centerZ);
+      }
+    }
+
+    // —— Scene ——
+    const canvas = document.getElementById('canvas');
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a12);
+    scene.fog = new THREE.Fog(0x0a0a12, 80, 220);
+
+    const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 500);
+    camera.position.set(40, 35, 40);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+    const controls = new OrbitControls(camera, canvas);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.minDistance = 10;
+    controls.maxDistance = 200;
+
+    // Ground grid
+    const gridHelper = new THREE.GridHelper(200, 50, 0x2a2a3a, 0x1e1e2a);
+    gridHelper.position.y = 0;
+    scene.add(gridHelper);
+
+    // Invisible ground plane for raycasting
+    const groundGeometry = new THREE.PlaneGeometry(500, 500);
+    const groundMat = new THREE.MeshBasicMaterial({ visible: false });
+    const ground = new THREE.Mesh(groundGeometry, groundMat);
+    ground.rotation.x = -Math.PI / 2;
+    scene.add(ground);
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    const hitTarget = new THREE.Vector3();
+
+    const whirlwinds = []; // { whirlwind: Whirlwind, mesh: THREE.Group }
+    let nextId = 1;
+
+    function createWhirlwindVisual(ww) {
+      const group = new THREE.Group();
+      group.position.set(ww.centerX, ww.centerY, ww.centerZ);
+
+      const particleCount = Math.min(400, Math.max(80, Math.floor(ww.radius * 4)));
+      const positions = new Float32Array(particleCount * 3);
+      const colors = new Float32Array(particleCount * 3);
+      const baseAngles = new Float32Array(particleCount);
+      const radii = new Float32Array(particleCount);
+
+      for (let i = 0; i < particleCount; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const r = 0.2 * ww.radius + Math.random() * ww.radius * 0.8;
+        baseAngles[i] = angle;
+        radii[i] = r;
+        const lr = Math.cos(angle) * r;
+        const lu = Math.sin(angle) * r;
+        positions[i * 3] = lr * ww.rightX + lu * ww.upX;
+        positions[i * 3 + 1] = lr * ww.rightY + lu * ww.upY;
+        positions[i * 3 + 2] = lr * ww.rightZ + lu * ww.upZ;
+        const t = 0.6 + 0.4 * Math.random();
+        colors[i * 3] = t * 0.7;
+        colors[i * 3 + 1] = t * 0.85;
+        colors[i * 3 + 2] = t;
+      }
+
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+      geo.setAttribute('baseAngle', new THREE.BufferAttribute(baseAngles, 1));
+      geo.setAttribute('radius', new THREE.BufferAttribute(radii, 1));
+      const mat = new THREE.PointsMaterial({
+        size: Math.max(0.4, ww.radius * 0.04),
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.85,
+        sizeAttenuation: true,
+      });
+      const points = new THREE.Points(geo, mat);
+      group.userData.points = points;
+      group.userData.particleCount = particleCount;
+      group.add(points);
+
+      // Ring at base (in whirlwind plane: normal = forward)
+      const ringGeo = new THREE.RingGeometry(ww.radius * 0.9, ww.radius, 64);
+      const ringMat = new THREE.MeshBasicMaterial({
+        color: 0x4488cc,
+        transparent: true,
+        opacity: 0.25,
+        side: THREE.DoubleSide,
+      });
+      const ring = new THREE.Mesh(ringGeo, ringMat);
+      const forward = new THREE.Vector3(ww.forwardX, ww.forwardY, ww.forwardZ);
+      ring.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), forward);
+      group.add(ring);
+
+      return group;
+    }
+
+    const WIND_DEFORM_SCALE = 0.15; // how much wind displaces the geometry
+
+    function pointsFromBufferGeometry(geometry) {
+      const pos = geometry.attributes.position;
+      if (!pos) return [];
+      const points = [];
+      for (let i = 0; i < pos.count; i++) {
+        points.push([pos.getX(i), pos.getY(i), pos.getZ(i)]);
+      }
+      return points;
+    }
+
+    function pointsFromGroup(group) {
+      const points = [];
+      group.updateMatrixWorld(true);
+      group.traverse((obj) => {
+        if (obj.isMesh && obj.geometry) {
+          const g = obj.geometry;
+          if (g.attributes.position) {
+            const pos = g.attributes.position;
+            const v = new THREE.Vector3();
+            for (let i = 0; i < pos.count; i++) {
+              v.set(pos.getX(i), pos.getY(i), pos.getZ(i)).applyMatrix4(obj.matrixWorld);
+              points.push([v.x, v.y, v.z]);
+            }
+          }
+        }
+      });
+      return points;
+    }
+
+    function centerAndScaleToWhirlwind(points, radius, scalePct) {
+      if (points.length === 0) return points;
+      const scaleFactor = (scalePct / 100) * radius;
+
+      // Center: subtract centroid
+      let cx = 0, cy = 0, cz = 0;
+      for (const p of points) {
+        cx += p[0]; cy += p[1]; cz += p[2];
+      }
+      const n = points.length;
+      cx /= n; cy /= n; cz /= n;
+      const centered = points.map((p) => [p[0] - cx, p[1] - cy, p[2] - cz]);
+
+      // Scale: fit max extent to scaleFactor
+      let maxDist = 0;
+      for (const p of centered) {
+        const d = Math.sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+        if (d > maxDist) maxDist = d;
+      }
+      if (maxDist < 1e-6) return centered;
+      const s = scaleFactor / maxDist;
+      return centered.map((p) => [p[0] * s, p[1] * s, p[2] * s]);
+    }
+
+    function attachPointsToEntry(entry, points, fileName) {
+      if (points.length === 0) {
+        alert('No geometry found in this file.');
+        return;
+      }
+      const ww = entry.whirlwind;
+      const scalePct = Number(document.getElementById('modelScale').value) || 90;
+      const transformed = centerAndScaleToWhirlwind(points, ww.radius, scalePct);
+
+      const group = entry.mesh;
+      const n = transformed.length;
+      const positions = new Float32Array(n * 3);
+      const restPositions = new Float32Array(n * 3);
+      const colors = new Float32Array(n * 3);
+
+      for (let i = 0; i < n; i++) {
+        const p = transformed[i];
+        positions[i * 3] = restPositions[i * 3] = p[0];
+        positions[i * 3 + 1] = restPositions[i * 3 + 1] = p[1];
+        positions[i * 3 + 2] = restPositions[i * 3 + 2] = p[2];
+        colors[i * 3] = 0.9;
+        colors[i * 3 + 1] = 0.75;
+        colors[i * 3 + 2] = 0.5;
+      }
+
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+      geo.setAttribute('restPosition', new THREE.BufferAttribute(restPositions, 3));
+
+      const mat = new THREE.PointsMaterial({
+        size: 0.4,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.9,
+        sizeAttenuation: true,
+      });
+      const pointsMesh = new THREE.Points(geo, mat);
+      group.add(pointsMesh);
+
+      entry.usdaPoints = pointsMesh;
+      entry.usdaRestPositions = restPositions;
+      entry.usdaFileName = fileName;
+      updateList();
+    }
+
+    function loadGeometryForEntry(entry, file) {
+      const ww = entry.whirlwind;
+      const group = entry.mesh;
+
+      if (entry.usdaPoints) {
+        group.remove(entry.usdaPoints);
+        entry.usdaPoints.geometry.dispose();
+        entry.usdaPoints = null;
+        entry.usdaRestPositions = null;
+      }
+
+      const ext = (file.name.split('.').pop() || '').toLowerCase();
+
+      if (ext === 'usda' || ext === 'usd') {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const points = parseUSDA(reader.result);
+          attachPointsToEntry(entry, points, file.name);
+        };
+        reader.readAsText(file);
+        return;
+      }
+
+      if (ext === 'stl') {
+        const reader = new FileReader();
+        reader.onload = () => {
+          try {
+            const stlLoader = new STLLoader();
+            const geometry = stlLoader.parse(reader.result);
+            const points = pointsFromBufferGeometry(geometry);
+            geometry.dispose();
+            attachPointsToEntry(entry, points, file.name);
+          } catch (err) {
+            alert('STL load failed: ' + (err.message || err));
+          }
+        };
+        reader.readAsArrayBuffer(file);
+        return;
+      }
+
+      if (ext === '3mf') {
+        const reader = new FileReader();
+        reader.onload = () => {
+          try {
+            const loader = new ThreeMFLoader();
+            const obj = loader.parse(reader.result);
+            const points = pointsFromGroup(obj);
+            attachPointsToEntry(entry, points, file.name);
+          } catch (err) {
+            alert('3MF load failed: ' + (err.message || err));
+          }
+        };
+        reader.readAsArrayBuffer(file);
+        return;
+      }
+
+      alert('Unsupported format. Use .usda, .usd, .stl, or .3mf');
+    }
+
+    function updateUSDAWithWind(entry) {
+      const ww = entry.whirlwind;
+      const pointsMesh = entry.usdaPoints;
+      if (!pointsMesh || !entry.usdaRestPositions) return;
+
+      const pos = pointsMesh.geometry.attributes.position;
+      const rest = entry.usdaRestPositions;
+      const n = pos.count;
+
+      for (let i = 0; i < n; i++) {
+        const rx = rest[i * 3];
+        const ry = rest[i * 3 + 1];
+        const rz = rest[i * 3 + 2];
+        const wind = ww.calculateWindVector3D(rx, ry, rz);
+        pos.setX(i, rx + WIND_DEFORM_SCALE * wind.x);
+        pos.setY(i, ry + WIND_DEFORM_SCALE * wind.y);
+        pos.setZ(i, rz + WIND_DEFORM_SCALE * wind.z);
+      }
+      pos.needsUpdate = true;
+    }
+
+    function updateWhirlwindVisual(entry, time) {
+      const ww = entry.whirlwind;
+      const group = entry.mesh;
+      group.position.set(ww.centerX, ww.centerY, ww.centerZ);
+
+      updateUSDAWithWind(entry);
+
+      const points = group.userData.points;
+      if (!points) return;
+      const pos = points.geometry.attributes.position;
+      const baseAngle = points.geometry.attributes.baseAngle;
+      const radii = points.geometry.attributes.radius;
+      const n = pos.count;
+
+      for (let i = 0; i < n; i++) {
+        const angle = baseAngle.array[i] + time * 1.2;
+        const r = radii.array[i];
+        const lr = Math.cos(angle) * r;
+        const lu = Math.sin(angle) * r;
+        pos.setX(i, lr * ww.rightX + lu * ww.upX);
+        pos.setY(i, lr * ww.rightY + lu * ww.upY);
+        pos.setZ(i, lr * ww.rightZ + lu * ww.upZ);
+      }
+      pos.needsUpdate = true;
+    }
+
+    function placeWhirlwind(worldPos) {
+      const radius = Number(document.getElementById('radius').value);
+      const intensity = Number(document.getElementById('intensity').value);
+      const pitch = Number(document.getElementById('pitch').value);
+      const yaw = 0;
+
+      const ww = new Whirlwind(worldPos.x, worldPos.y, worldPos.z, radius, intensity, yaw, pitch);
+      const mesh = createWhirlwindVisual(ww);
+      scene.add(mesh);
+
+      const id = nextId++;
+      whirlwinds.push({
+        id,
+        whirlwind: ww,
+        mesh,
+        usdaFileName: null,
+        usdaPoints: null,
+        usdaRestPositions: null,
+      });
+      updateList();
+      return id;
+    }
+
+    function updateList() {
+      const list = document.getElementById('whirlwind-list');
+      list.innerHTML = whirlwinds.map((entry) => {
+        const { id, whirlwind: ww, usdaFileName } = entry;
+        const fileLabel = usdaFileName || 'No model';
+        return `<div class="item" data-id="${id}">
+          <span class="label">#${id} r=${ww.radius.toFixed(0)} i=${ww.intensity.toFixed(2)}</span>
+          <input type="file" accept=".usda,.usd,.stl,.3mf" class="usda-input" data-id="${id}">
+          <button type="button" class="usda-btn" data-id="${id}">Model</button>
+          <span class="usda-name" title="${fileLabel}">${fileLabel}</span>
+          <button type="button" data-id="${id}" data-action="remove">Remove</button>
+        </div>`;
+      }).join('');
+
+      list.querySelectorAll('.usda-input').forEach((input) => {
+        input.addEventListener('change', (e) => {
+          const id = parseInt(input.dataset.id, 10);
+          const entry = whirlwinds.find((x) => x.id === id);
+          const file = e.target.files[0];
+          if (entry && file) loadGeometryForEntry(entry, file);
+          input.value = '';
+        });
+      });
+
+      list.querySelectorAll('.usda-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const id = parseInt(btn.dataset.id, 10);
+          const item = list.querySelector(`.item[data-id="${id}"]`);
+          const input = item && item.querySelector('.usda-input');
+          if (input) input.click();
+        });
+      });
+
+      list.querySelectorAll('button[data-action="remove"]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const id = parseInt(btn.dataset.id, 10);
+          const idx = whirlwinds.findIndex((e) => e.id === id);
+          if (idx !== -1) {
+            const entry = whirlwinds[idx];
+            if (entry.usdaPoints) {
+              entry.mesh.remove(entry.usdaPoints);
+              entry.usdaPoints.geometry.dispose();
+            }
+            scene.remove(entry.mesh);
+            whirlwinds.splice(idx, 1);
+            updateList();
+          }
+        });
+      });
+    }
+
+    function clearAll() {
+      whirlwinds.forEach(({ mesh }) => scene.remove(mesh));
+      whirlwinds.length = 0;
+      updateList();
+    }
+
+    canvas.addEventListener('click', (e) => {
+      mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+      raycaster.setFromCamera(mouse, camera);
+      const hits = raycaster.intersectObject(ground);
+      if (hits.length) {
+        hitTarget.copy(hits[0].point);
+        placeWhirlwind(hitTarget.clone());
+      }
+    });
+
+    document.getElementById('radius').addEventListener('input', e => {
+      document.getElementById('radiusVal').textContent = e.target.value;
+    });
+    document.getElementById('intensity').addEventListener('input', e => {
+      document.getElementById('intensityVal').textContent = Number(e.target.value).toFixed(2);
+    });
+    document.getElementById('pitch').addEventListener('input', e => {
+      document.getElementById('pitchVal').textContent = e.target.value;
+    });
+    document.getElementById('modelScale').addEventListener('input', e => {
+      document.getElementById('modelScaleVal').textContent = e.target.value;
+    });
+    document.getElementById('btn-clear').addEventListener('click', clearAll);
+
+    document.getElementById('radiusVal').textContent = document.getElementById('radius').value;
+    document.getElementById('intensityVal').textContent = document.getElementById('intensity').value;
+    document.getElementById('pitchVal').textContent = document.getElementById('pitch').value;
+    document.getElementById('modelScaleVal').textContent = document.getElementById('modelScale').value;
+
+    function resize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    const clock = new THREE.Clock();
+    function animate() {
+      requestAnimationFrame(animate);
+      const time = clock.getElapsedTime();
+      controls.update();
+
+      whirlwinds.forEach(entry => {
+        updateWhirlwindVisual(entry, time);
+      });
+
+      renderer.render(scene, camera);
+    }
+    animate();
+  </script>
+</body>
+</html>
